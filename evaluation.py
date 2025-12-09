@@ -27,8 +27,10 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import seaborn as sns
 from scipy import sparse
 import matplotlib.pyplot as plt
+from sklearn.metrics import pairwise_distances
 
 # ----------------- 路径设置 -----------------
 WORKDIR = Path("pancreas_work")
@@ -161,6 +163,37 @@ def load_expression_and_graph():
     return adata_sp, Y, X_ref, L, list(ct_levels)
 
 
+def build_ground_truth_W(adata_sp, ct_levels):
+    """
+    如果 adata_sp.obs 里有 'cell_type'，根据它构造一个 one-hot 的真实分布 W_true：
+    - W_true.shape = (S, K)，K 顺序和 ct_levels 一致
+    - 每个 spot 的真实 cell_type 那一列为 1，其它为 0
+    """
+    if "cell_type" not in adata_sp.obs:
+        print("[INFO] adata_sp.obs 里没有 'cell_type'，无法构造真实分布，跳过 GT 对比。")
+        return None
+
+    labels = adata_sp.obs["cell_type"].astype(str).values
+    S = adata_sp.n_obs
+    K = len(ct_levels)
+
+    ct_to_idx = {ct: i for i, ct in enumerate(ct_levels)}
+    W_true = np.zeros((S, K), dtype=float)
+
+    n_missing = 0
+    for s, ct in enumerate(labels):
+        j = ct_to_idx.get(ct, None)
+        if j is None:
+            n_missing += 1
+            continue
+        W_true[s, j] = 1.0
+
+    if n_missing > 0:
+        print(f"[WARN] 有 {n_missing} 个 spot 的 cell_type 不在 ct_levels 中，对应行为全 0。")
+
+    return W_true
+
+
 # ----------------- 2. 读取各模型的 W，并对齐 cell-type 顺序 -----------------
 def align_W_to_ct(dfW, canonical_cts):
     """
@@ -187,7 +220,6 @@ def load_model_weights(adata_sp, ct_levels):
     - lasso
     - card
     - destvi
-    - rctd（如果你之后实现了的话）
     返回：models = {name: {"W": W, "ct_names": ct_levels}}
     """
     models = {}
@@ -354,6 +386,133 @@ def analyze_global_composition(models, ct_names):
     return df
 
 
+def compare_models_to_truth(models, W_true, ct_names, adata_sp):
+    """
+    对每个模型的 W 和真实分布 W_true 做对比：
+    - per-spot L1 / L2 距离
+    - top-1 准确率（预测概率最大的 cell-type 是否等于真实类型）
+    - 真实类型的平均预测概率（answer 类似 “type A 30% + type B 60%...” 这种）
+    """
+    if W_true is None:
+        print("[INFO] 没有 W_true，跳过真实分布对比。")
+        return None, None
+
+    S, K = W_true.shape
+    true_label = W_true.argmax(axis=1)  # 每个 spot 的真实 cell-type index
+
+    summary_records = []
+    per_spot_records = []
+
+    for name, info in models.items():
+        W = np.asarray(info["W"], dtype=float)
+        if W.shape != W_true.shape:
+            raise ValueError(f"[ERR] {name}: W 形状 {W.shape} 与 W_true {W_true.shape} 不一致")
+
+        # 保险起见，再做一次非负 + 行归一化
+        W_clip = np.clip(W, 0, None)
+        row_sums = W_clip.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        W_norm = W_clip / row_sums
+
+        # per-spot L1 / L2
+        diff = W_norm - W_true
+        L1 = np.abs(diff).sum(axis=1)
+        L2 = np.sqrt((diff ** 2).sum(axis=1))
+
+        # top-1 预测类别
+        pred_label = W_norm.argmax(axis=1)
+        top1_acc = float((pred_label == true_label).mean())
+
+        # 真实 cell-type 的预测概率（因为 W_true 是 one-hot，可用逐元素乘再按行求和）
+        p_true = (W_norm * W_true).sum(axis=1)
+        mean_p_true = float(p_true.mean())
+
+        summary_records.append({
+            "model": name,
+            "mean_L1": float(L1.mean()),
+            "median_L1": float(np.median(L1)),
+            "mean_L2": float(L2.mean()),
+            "median_L2": float(np.median(L2)),
+            "top1_accuracy": top1_acc,
+            "mean_true_prob": mean_p_true,
+        })
+
+        df_spot = pd.DataFrame({
+            "spot": adata_sp.obs_names,
+            "model": name,
+            "true_ct": [ct_names[i] if i < len(ct_names) else "UNK" for i in true_label],
+            "pred_top1_ct": [ct_names[i] if i < len(ct_names) else "UNK" for i in pred_label],
+            "true_prob": p_true,
+            "L1": L1,
+            "L2": L2,
+        })
+        per_spot_records.append(df_spot)
+
+    summary_df = pd.DataFrame(summary_records)
+    per_spot_df = pd.concat(per_spot_records, axis=0, ignore_index=True)
+
+    summary_path = OUTDIR / "composition_vs_truth_summary.csv"
+    detail_path  = OUTDIR / "composition_vs_truth_per_spot.csv"
+
+    summary_df.to_csv(summary_path, index=False)
+    per_spot_df.to_csv(detail_path, index=False)
+
+    print("[OK] 保存真实分布对比 summary ->", summary_path)
+    print("[OK] 保存真实分布对比 per-spot 明细 ->", detail_path)
+
+    return summary_df, per_spot_df
+
+
+def check_oversmoothing(models, baseline_name="Linear"):
+    """
+    简单检查每个模型的：
+    - mean per-type std（composition 在 spots 之间的方差）
+    - mean pairwise distance（spot-spot composition 距离）
+    用 baseline（默认 Linear）当参照，看看会不会 oversmoothing。
+    """
+    stats = []
+
+    # 先取 baseline 的 W
+    if baseline_name not in models:
+        print(f"[WARN] baseline 模型 {baseline_name} 不在 models 里，跳过 oversmoothing 检查")
+        return None
+
+    W_base = models[baseline_name]["W"]   # S × K
+    base_std = W_base.std(axis=0).mean()
+
+    for name, info in models.items():
+        W = info["W"]  # S × K
+
+        per_type_std = W.std(axis=0)
+        mean_std = float(per_type_std.mean())
+
+        # spot-spot 平均距离（用 cosine 或 euclidean 都可以）
+        D = pairwise_distances(W, metric="cosine")
+        mean_dist = float(D[np.triu_indices_from(D, k=1)].mean())
+
+        ratio = mean_std / base_std if base_std > 0 else np.nan
+
+        stats.append({
+            "model": name,
+            "mean_per_type_std": mean_std,
+            "mean_pairwise_dist": mean_dist,
+            "std_ratio_vs_baseline": ratio,
+        })
+
+        print(
+            f"[OVER] {name}: mean_std={mean_std:.4f}, "
+            f"mean_pairwise_dist={mean_dist:.4f}, "
+            f"std_ratio_vs_{baseline_name}={ratio:.3f}"
+        )
+
+        if name != baseline_name and ratio < 0.3:
+            print(f"   --> WARNING: {name} 可能存在 oversmoothing（std < 30% baseline）")
+
+    df_stats = pd.DataFrame(stats)
+    df_stats.to_csv(OUTDIR / "oversmoothing_stats.csv", index=False)
+    print("[OK] 保存 oversmoothing 指标 ->", OUTDIR / "oversmoothing_stats.csv")
+    return df_stats
+
 def quick_plots(summary_df, per_spot_df):
     """画几张简单图，帮助写 report。"""
     # 1) 模型级 R² / residual 对比条形图
@@ -397,11 +556,81 @@ def quick_plots(summary_df, per_spot_df):
 
     print("[OK] 保存 evaluation 图像到:", OUTDIR)
 
+def plot_true_prob_box(gt_per_spot):
+    """
+    gt_per_spot: compare_models_to_truth 生成的 per-spot 明细
+                 必须至少包含列：['model', 'true_prob']
+    画出：每个模型对真实 cell type 的预测概率分布 boxplot
+    """
+    if gt_per_spot is None or len(gt_per_spot) == 0:
+        print("[INFO] 没有 gt_per_spot，跳过 true_prob boxplot.")
+        return
+
+    models = gt_per_spot["model"].unique().tolist()
+    data = [gt_per_spot.loc[gt_per_spot["model"] == m, "true_prob"].values
+            for m in models]
+
+    plt.figure(figsize=(6, 4), dpi=200)
+    plt.boxplot(data, labels=models, showfliers=False)
+    plt.ylabel("Predicted probability of true cell type")
+    plt.title("True cell-type probability across models")
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "true_prob_boxplot.png")
+    plt.close()
+
+def plot_global_composition_with_truth(comp_df, adata_sp, ct_levels):
+    """
+    comp_df: analyze_global_composition 返回的 DataFrame
+             列：['model', 'cell_type', 'mean_prop']
+    在此基础上加入真实的 cell_type 占比（基于 adata_sp.obs['cell_type']），
+    再画同一张柱状图。
+    """
+    if "cell_type" not in adata_sp.obs:
+        print("[INFO] adata_sp.obs 里没有 'cell_type'，无法加入真实占比。")
+        comp_with_truth = comp_df
+    else:
+        labels = adata_sp.obs["cell_type"].astype(str)
+        total = float(len(labels))
+        counts = labels.value_counts()
+
+        rows = []
+        for ct in ct_levels:
+            prop = counts.get(ct, 0.0) / total
+            rows.append({"model": "Truth", "cell_type": ct, "mean_prop": prop})
+        df_truth = pd.DataFrame(rows)
+
+        comp_with_truth = pd.concat([comp_df, df_truth], axis=0, ignore_index=True)
+
+    # 作图
+    models = comp_with_truth["model"].unique().tolist()
+    cell_types = ct_levels
+
+    x = np.arange(len(cell_types))
+    width = 0.8 / len(models)  # 每个模型一小条
+
+    plt.figure(figsize=(10, 5), dpi=200)
+    for i, m in enumerate(models):
+        sub = comp_with_truth[comp_with_truth["model"] == m]
+        # 保证顺序一致
+        sub = sub.set_index("cell_type").reindex(cell_types)
+        y = sub["mean_prop"].values
+        plt.bar(x + i * width, y, width=width, label=m)
+
+    plt.xticks(x + width * (len(models) - 1) / 2, cell_types, rotation=90)
+    plt.ylabel("Proportion")
+    plt.title("Global cell-type composition (models vs Truth)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "global_celltype_composition_with_truth.png")
+    plt.close()
 
 # ----------------- 5. main -----------------
 def main():
     # 1) 表达 & 图
     adata_sp, Y, X_ref, L, ct_levels = load_expression_and_graph()
+
+    # 1.5) 构造真实分布（如果有的话）
+    W_true = build_ground_truth_W(adata_sp, ct_levels)
 
     # 2) 加载各模型 W
     models = load_model_weights(adata_sp, ct_levels)
@@ -412,8 +641,16 @@ def main():
     # 4) 全局 cell-type 分布
     comp_df = analyze_global_composition(models, ct_levels)
 
+    # 4.3) 和真实分布对比
+    gt_summary, gt_per_spot = compare_models_to_truth(models, W_true, ct_levels, adata_sp)
+
+    # 4.5) 检查是否 oversmoothing（默认拿 Linear 当 baseline）
+    over_stats = check_oversmoothing(models, baseline_name="Linear")
+
     # 5) 一些 quick plots
-    quick_plots(summary_df, per_spot_df)
+    quick_plots(summary_df, per_spot_df)  # 原有几张
+    plot_true_prob_box(gt_per_spot)  # 新增：真实概率 boxplot
+    plot_global_composition_with_truth(comp_df, adata_sp, ct_levels)
 
     print("\n===== Evaluation Done =====")
     print(summary_df)

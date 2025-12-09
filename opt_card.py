@@ -18,8 +18,8 @@ OUT_CSV  = Path("pancreas_work/opt_card_proportions.csv")
 # ------------------------------
 # 超参数（可再调）
 # ------------------------------
-LAMBDA_REG  = 1.0      # 空间正则 λ（比之前 0.1 稍大，让平滑项更有存在感）
-LR           = 1e-2     # Adam 学习率
+LAMBDA_REG  = 0.1    # 空间正则 λ（比之前 0.1 稍大，让平滑项更有存在感）
+LR           = 1e-3     # Adam 学习率
 N_ITER       = 400      # 迭代次数
 PRINT_EVERY  = 50
 
@@ -201,12 +201,10 @@ def card_optimize_torch(Y_np, X_np, L_csr, W_init_np,
 
         optimizer.step()
 
-        # 约束：W >= 0, 每行和为 1
+        # 约束：W >= 0
         with torch.no_grad():
             W.clamp_(min=0.0)
-            row_sums = W.sum(dim=1, keepdim=True)
-            row_sums[row_sums == 0] = 1.0
-            W.div_(row_sums)
+
 
         if it % print_every == 0 or it == 1 or it == n_iter:
             dl = data_loss.detach().cpu().item()
@@ -231,6 +229,14 @@ def main():
     adata_sp, Y, X_ref, L, W_init, ct_names = load_data()
 
     W_card = card_optimize_torch(Y, X_ref, L, W_init)
+
+
+    # ---------- 训练结束后再做一次归一化（用于解释/对比） ----------
+    # 如果你希望它是 per-spot 的比例，可以这样：
+    W_card = np.clip(W_card, 0, None)
+    row_sums = W_card.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    W_card = W_card / row_sums
 
     # 写回 AnnData & CSV
     adata_sp.obsm["W_card"] = W_card
